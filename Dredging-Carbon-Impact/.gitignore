@@ -1,0 +1,12 @@
+# R et targets
+.Rhistory
+.RData
+.Rproj.user/
+_targets/
+
+# Données volumineuses non versionnées
+/data/raw/
+/data/processed/
+
+# Environnement renv
+/renv/library/
