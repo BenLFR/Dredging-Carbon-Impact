@@ -1,45 +1,68 @@
 name: Pipeline-CI
+
 on:
   push:
-    branches: [main]
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+  workflow_dispatch:        # déclenchement manuel optionnel
 
 jobs:
   build:
-    # GitHub a quand même besoin d'un runner hôte
     runs-on: ubuntu-latest
 
-    # >>> Conteneur R + stack géospatiale complète <<<
-    container:
+    container:               # ① image avec libs spatiales pré-installées
       image: rocker/geospatial:4.4.3
-      #   → R 4.4, GDAL, PROJ, GEOS, netCDF, etc.
-      options: --user=1001  # évite des problèmes de permissions sur le cache
+
+    env:                     # ② réutilise votre lockfile
+      RENV_PATHS_ROOT: ~/.local/share/renv
+      RENV_CONFIG_CACHE_SYMLINKS: "FALSE"
 
     steps:
-      # 1) Checkout du code
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 1
+    - name: Checkout repo
+      uses: actions/checkout@v4
 
-      # 2) (Optionnel) apt-get remis “au cas où”
-      - name: Ensure system libs (idempotent)
-        run: |
-          apt-get update -y
-          apt-get install -y --no-install-recommends \
-            gdal-bin libgdal-dev \
-            libproj-dev proj-bin proj-data \
-            libgeos-dev libnetcdf-dev || true
+    - name: Set up R
+      uses: r-lib/actions/setup-r@v2
 
-      # 3) Installation de R (déjà présent, mais setup-r règle les options)
-      - uses: r-lib/actions/setup-r@v2
-        with:
-          r-version: '4.4'
+    - name: Session information (avant renv)
+      run: |
+        echo "## Basic system info"
+        gdalinfo --version || true
+        projinfo --version || true
+        Rscript -e 'sessionInfo()'
 
-      # 4) Renv : restaure (ou crée) le cache des paquets
-      - uses: r-lib/actions/setup-renv@v2
-        with:
-          cache: true
+    - name: Restore renv cache
+      uses: r-lib/actions/setup-renv@v2
+      with:
+        cache-version: 2      # purge facile si besoin
 
-      # 5) Exécution du pipeline
-      - name: Run targets pipeline
-        run: |
-          Rscript -e "targets::tar_make()"
+    - name: Run pipeline
+      id:  targetrun
+      run: |
+        Rscript -e 'targets::tar_make()'
+
+    # ------------------------------------------------------------------
+    # ③ Étapes de débogage supplémentaires
+    # ------------------------------------------------------------------
+    - name: Print sessionInfo() after build
+      if: always()
+      run: |
+        Rscript -e 'sessionInfo()'
+
+    - name: Upload full logs when the job fails
+      if: failure()           # n’exécute que si ça a échoué
+      uses: actions/upload-artifact@v4
+      with:
+        name: full-log
+        path: ${{ runner.temp }}/_temp/_runner_files/*
+
+    # ------------------------------------------------------------------
+    # ④ Facultatif : Publier le rapport de targets
+    # ------------------------------------------------------------------
+    # - name: Upload tar_make() visualisation
+    #   if: success()
+    #   uses: actions/upload-artifact@v4
+    #   with:
+    #     name: targets-visual
+    #     path: targets.html
