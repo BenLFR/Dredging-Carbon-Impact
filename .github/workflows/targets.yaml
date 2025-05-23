@@ -18,6 +18,23 @@ jobs:
     steps:
     - uses: actions/checkout@v4
 
+    - name: Print PATH
+      run: echo $PATH
+
+    - name: Find gdal-config
+      run: find / -name gdal-config -type f 2>/dev/null || echo "gdal-config not found"
+
+    - name: List common bin directories
+      run: |
+        ls -la /usr/bin
+        ls -la /usr/local/bin
+
+    - name: List common GDAL directories
+      run: |
+        ls -la /opt/gdal* || echo "/opt/gdal* not found"
+        ls -la /usr/lib/gdal* || echo "/usr/lib/gdal* not found"
+        ls -la /usr/include/gdal* || echo "/usr/include/gdal* not found"
+
     # ------------------------------------------------------------------
     # 1. Restaurer l’environnement renv + cache binaire
     # ------------------------------------------------------------------
