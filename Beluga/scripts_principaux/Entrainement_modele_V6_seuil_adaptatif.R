@@ -147,15 +147,27 @@ ais_data_core[is.na(delta_t), delta_t := delta_t_max]
 ais_data_core[, delta_t := pmin(pmax(delta_t, 1), delta_t_max)]
 
 # 6.c SEUIL D'ARRÊT ADAPTATIF PAR NAVIRE
-v_min <- 0.15; v_max <- 0.80; seuil_global <- 0.30; n_min <- 1000
-dbg_head("🔧 Calcul des seuils d'arrêt adaptatifs par navire")
-seuils_par_navire <- ais_data_core[Speed > 0, .(q05 = quantile(Speed, 0.05, na.rm = TRUE), N = .N), by = Navire]
-seuils_par_navire[, seuil_adapt := pmax(v_min, pmin(v_max, q05))]
-seuils_par_navire[N < n_min, seuil_adapt := seuil_global]
-ais_data_core <- merge(ais_data_core, seuils_par_navire[, .(Navire, seuil_adapt)], by = "Navire", all.x = TRUE)
+compute_seuils <- function(dt, v_min = 0.15, v_max = 0.80,
+                          seuil_global = 0.30, n_min = 1000) {
+  dbg_head("🔧 Calcul des seuils d'arrêt adaptatifs par navire")
+  tmp <- dt[Speed > 0,
+            .(q05 = quantile(Speed, 0.05, na.rm = TRUE), N = .N),
+            by = Navire]
+  tmp[, seuil_adapt := pmax(v_min, pmin(v_max, q05))]
+  tmp[N < n_min, seuil_adapt := seuil_global]
+  dt <- merge(dt, tmp[, .(Navire, seuil_adapt)], by = "Navire", all.x = TRUE)
+  list(dt = dt,
+       diag = tmp[, .(Navire, N_pts = N,
+                      q05_kn = round(q05, 3),
+                      seuil_final = round(seuil_adapt, 3))])
+}
+
+seuils_out <- compute_seuils(ais_data_core)
+ais_data_core <- seuils_out$dt
+diag_seuils   <- seuils_out$diag
 ais_data_core[, is_stop := Speed <= seuil_adapt]
-diag_seuils <- seuils_par_navire[, .(Navire, N_pts = N, q05_kn = round(q05, 3), seuil_final = round(seuil_adapt, 3))]
-dbg_head("📊 Seuils d'arrêt calculés par navire :"); print(diag_seuils)
+dbg_head("📊 Seuils d'arrêt calculés par navire :")
+print(diag_seuils)
 
 # ==============================================================================
 # 6.d  Filtrage spatial des arrêts : DBSCAN/HDBSCAN
