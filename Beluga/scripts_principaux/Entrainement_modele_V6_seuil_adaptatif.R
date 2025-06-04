@@ -14,6 +14,9 @@ suppressPackageStartupMessages({
   library(zoo)
   if (!require(pbapply)) install.packages("pbapply", repos="https://cloud.r-project.org"); library(pbapply)
   if (!require(matrixStats)) install.packages("matrixStats", repos="https://cloud.r-project.org"); library(matrixStats)
+  if (!require(outliers)) install.packages("outliers", repos="https://cloud.r-project.org"); library(outliers)
+  if (!require(dbscan)) install.packages("dbscan", repos="https://cloud.r-project.org"); library(dbscan)
+  if (!require(depmixS4)) install.packages("depmixS4", repos="https://cloud.r-project.org"); library(depmixS4)
 })
 
 # 1.a Fonctions debug
@@ -126,6 +129,19 @@ ais_data_core[, Course_change := {delta <- c(NA, abs(diff(Course))); delta <- pm
 ais_data_core[is.na(Course_change), Course_change := 0]
 q95 <- quantile(ais_data_core$Course_change, 0.95, na.rm = TRUE)
 ais_data_core[, norm_course_change := pmax(0, pmin(1, 1 - Course_change/q95))]
+
+# Pondération temporelle (Δt) pour chaque ping
+ais_data_core <- ais_data_core[order(Navire, Seg_id, Timestamp)]
+ais_data_core[, delta_t := c(as.numeric(diff(Timestamp)), NA), by = .(Navire, Seg_id)]
+ais_data_core[delta_t <= 0 | delta_t > 900 | is.na(delta_t), delta_t := 60]
+
+# Détection d'outliers sur la vitesse (test de Grubbs)
+dbg_head("🔎 Détection d'outliers de vitesse (Grubbs)")
+g_out <- tryCatch(grubbs.test(ais_data_core$Speed), error=function(e) NULL)
+if (!is.null(g_out) && g_out$p.value < 0.01) {
+  ais_data_core <- ais_data_core[Speed <= 20]
+  dbg_head("Outliers supprimés")
+}
 
 # ==============================================================================
 # 6.d  Filtrage spatial des arrêts : DBSCAN/HDBSCAN
@@ -262,6 +278,24 @@ ais_data_core[, behavior_smooth := smooth_behavior_transition(behavior, Speed, t
 ais_data_core[, sub_seg_id := paste0(Seg_id,"_",rleid(behavior_smooth))]
 dbg_head("🎭 Lissage comportemental terminé")
 
+# HMM à 5 états pour validation complémentaire
+hmm_smoother <- function(spd_std, n_states = 5) {
+  keep <- !is.na(spd_std)
+  v <- spd_std[keep]
+  if (length(v) < 20) return(rep(NA_integer_, length(spd_std)))
+  d <- data.frame(spd = v)
+  mod <- depmix(spd ~ 1, data = d, nstates = n_states, family = gaussian())
+  fit <- tryCatch(fit(mod, verbose = FALSE), error=function(e) NULL)
+  if (is.null(fit)) return(rep(NA_integer_, length(spd_std)))
+  states <- posterior(fit, type="viterbi")$state
+  out <- rep(NA_integer_, length(spd_std)); out[keep] <- states; out
+}
+ais_data_core[, Speed_std := scale(Speed)]
+ais_data_core[, hmm_state := hmm_smoother(Speed_std), by = Navire]
+state_speed <- ais_data_core[!is.na(hmm_state), .(mean_spd = mean(Speed_std)), by = hmm_state][order(mean_spd)]
+map_states <- setNames(c("stops","slow_maneuvers","dredging","loaded_transit","unloaded_transit"), state_speed$hmm_state)
+ais_data_core[, behavior_hmm := map_states[as.character(hmm_state)]]
+
 # 11. Scores composites
 mu_speed <- 2.25; sigma_speed <- 1.0
 ais_data_core[, prob_dredge_gmm := p_component_3]
@@ -324,16 +358,16 @@ eval_cross_validation_robust <- function(ais_tmp, approach_name, w) {
     } else {
       train[, score_fold := score_tmp]; test[, score_fold := score_tmp]
     }
-    glm_fit <- glm(label_tmp_num ~ score_fold, data = train, family = binomial(link = "logit"))
+    glm_fit <- glm(label_tmp_num ~ score_fold, data = train, family = binomial(link = "logit"), weights = train$delta_t)
     probs   <- predict(glm_fit, newdata = test, type = "response")
-    aucs[k] <- pROC::auc(pROC::roc(test$label_tmp_num, probs, quiet=TRUE))
+    aucs[k] <- pROC::auc(pROC::roc(test$label_tmp_num, probs, quiet=TRUE, weights = test$delta_t))
   }
   mean(aucs, na.rm = TRUE)
 }
-eval_weights_GMM <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*prob_dredge_gmm + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Speed, norm_course_change, norm_accel, Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "GMM", w)}
-eval_weights_SPEED <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_norm + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "SPEED", w)}
-eval_weights_RANGE <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_in_dredge_range + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "RANGE", w)}
-eval_weights_OLD <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*dredging_indicator + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "OLD", w)}
+eval_weights_GMM <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*prob_dredge_gmm + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Speed, norm_course_change, norm_accel, Annee, Navire, delta_t)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "GMM", w)}
+eval_weights_SPEED <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_norm + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire, delta_t)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "SPEED", w)}
+eval_weights_RANGE <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_in_dredge_range + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire, delta_t)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "RANGE", w)}
+eval_weights_OLD <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*dredging_indicator + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire, delta_t)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "OLD", w)}
 
 # === GRID SEARCH ===
 DBG_PRINT_EVERY <- 10

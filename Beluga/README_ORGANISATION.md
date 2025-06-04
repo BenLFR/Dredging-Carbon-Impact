@@ -11,6 +11,8 @@ Contient les scripts R principaux pour le traitement des données et l'entraîne
 - `Entrainement modele V5 tri années.R` - Script d'entraînement du modèle V5
 - `Entrainement modele V5 tri années cluster.R` - Version avec clustering
 - `Entrainement modele V5 tri années cluster_NO_SF.R` - Version sans SF
+- `Entrainement_modele_V6_seuil_adaptatif.R` - Nouveau script avec
+  seuils par navire, filtrage spatial, pondération temporelle et HMM
 
 ### `tests/`
 Scripts de test et validation :
