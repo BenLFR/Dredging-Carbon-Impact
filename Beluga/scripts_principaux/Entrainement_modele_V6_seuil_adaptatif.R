@@ -14,6 +14,9 @@ suppressPackageStartupMessages({
   library(zoo)
   if (!require(pbapply)) install.packages("pbapply", repos="https://cloud.r-project.org"); library(pbapply)
   if (!require(matrixStats)) install.packages("matrixStats", repos="https://cloud.r-project.org"); library(matrixStats)
+  if (!require(outliers)) install.packages("outliers", repos="https://cloud.r-project.org"); library(outliers)
+  if (!require(dbscan)) install.packages("dbscan", repos="https://cloud.r-project.org"); library(dbscan)
+  if (!require(depmixS4)) install.packages("depmixS4", repos="https://cloud.r-project.org"); library(depmixS4)
 })
 
 # 1.a Fonctions debug
@@ -120,12 +123,48 @@ ais_data_core[, Activity := fifelse(Speed < 0.5, "manoeuvres/arrets",
                              fifelse(Speed < 18, "transit_unloaded","Autre"))))]
 
 # 6. Feature engineering
-ais_data_core[, Accel := {dV <- c(NA, diff(Speed)); dt <- c(NA, diff(as.numeric(Timestamp))); dV/dt}, by = Seg_id]
+
+# Détection d'outliers sur la vitesse (test de Grubbs)
+dbg_head("🔎 Détection d'outliers de vitesse (Grubbs)")
+g_out <- tryCatch(grubbs.test(ais_data_core$Speed), error=function(e) NULL)
+if (!is.null(g_out) && g_out$p.value < 0.01) {
+  ais_data_core <- ais_data_core[Speed <= 20]
+  dbg_head("Outliers supprimés")
+}
+
+# Recalculer les variables dépendantes après filtrage
+ais_data_core <- ais_data_core[order(Navire, Seg_id, Timestamp)]
+ais_data_core[, Accel := {dV <- c(NA, diff(Speed));
+                          dt <- c(NA, diff(as.numeric(Timestamp))); dV/dt},
+               by = Seg_id]
 ais_data_core[is.na(Accel) | !is.finite(Accel), Accel := 0]
-ais_data_core[, Course_change := {delta <- c(NA, abs(diff(Course))); delta <- pmin(delta, 360-delta); delta}, by=Seg_id]
+ais_data_core[, Course_change := {delta <- c(NA, abs(diff(Course))); delta <- pmin(delta, 360 - delta); delta}, by = Seg_id]
 ais_data_core[is.na(Course_change), Course_change := 0]
 q95 <- quantile(ais_data_core$Course_change, 0.95, na.rm = TRUE)
 ais_data_core[, norm_course_change := pmax(0, pmin(1, 1 - Course_change/q95))]
+
+# 6.c SEUIL D'ARRÊT ADAPTATIF PAR NAVIRE
+compute_seuils <- function(dt, v_min = 0.15, v_max = 0.80,
+                          seuil_global = 0.30, n_min = 1000) {
+  dbg_head("🔧 Calcul des seuils d'arrêt adaptatifs par navire")
+  tmp <- dt[Speed > 0,
+            .(q05 = quantile(Speed, 0.05, na.rm = TRUE), N = .N),
+            by = Navire]
+  tmp[, seuil_adapt := pmax(v_min, pmin(v_max, q05))]
+  tmp[N < n_min, seuil_adapt := seuil_global]
+  dt <- merge(dt, tmp[, .(Navire, seuil_adapt)], by = "Navire", all.x = TRUE)
+  list(dt = dt,
+       diag = tmp[, .(Navire, N_pts = N,
+                      q05_kn = round(q05, 3),
+                      seuil_final = round(seuil_adapt, 3))])
+}
+
+seuils_out <- compute_seuils(ais_data_core)
+ais_data_core <- seuils_out$dt
+diag_seuils   <- seuils_out$diag
+ais_data_core[, is_stop := Speed <= seuil_adapt]
+dbg_head("📊 Seuils d'arrêt calculés par navire :")
+print(diag_seuils)
 
 # ==============================================================================
 # 6.d  Filtrage spatial des arrêts : DBSCAN/HDBSCAN
@@ -135,7 +174,7 @@ library(dbscan) # déjà chargé en tête
 
 # Fonction pour calculer eps automatiquement (heuristique ou k-distance)
 auto_eps <- function(coords, k = 4) {
-  # coords : matrice [lon, lat]
+  # coords : matrice [lon, lat] en degrés (1 m ~ 0.000009°)
   dists <- kNNdist(coords, k = k)
   # Heuristique : 1 % de la médiane des distances entre arrêts
   eps_heur <- 0.01 * median(dists, na.rm = TRUE)
@@ -152,13 +191,15 @@ cluster_stops_spatial <- function(dt, eps = NULL, minPts = 4) {
     return(dt)
   }
   coords <- as.matrix(arr[, .(Lon, Lat)])
-  # Calculer eps si non fourni
+  # Calculer eps si non fourni. Passer eps manuellement si la densité varie beaucoup
   if (is.null(eps)) eps <- auto_eps(coords, k = minPts)
   db <- dbscan(coords, eps = eps, minPts = minPts)
   arr[, stop_cluster_id := db$cluster]
   arr[, stop_cluster_core := db$cluster > 0]
   # Remettre les labels dans le jeu principal
-  dt <- merge(dt, arr[, .(Timestamp, stop_cluster_id, stop_cluster_core)], by = "Timestamp", all.x = TRUE)
+  dt <- merge(dt,
+              arr[, .(Seg_id, Timestamp, stop_cluster_id, stop_cluster_core)],
+              by = c("Seg_id", "Timestamp"), all.x = TRUE)
   # True stop : arrêt ET cluster spatial
   dt[, is_stop_spatial := is_stop & !is.na(stop_cluster_id) & stop_cluster_id > 0]
   return(dt)
@@ -181,28 +222,25 @@ print(diag_dbscan)
 cat("Pourcentage d'arrêts dans un cluster spatial (port/mouillage) :",
     round(100*mean(ais_data_core[is_stop == TRUE]$stop_cluster_core, na.rm = TRUE), 1), "%\n")
 
+
 # Remarque : utiliser is_stop_spatial à la place de is_stop dans les étapes suivantes
 
-# 6.c SEUIL D'ARRÊT ADAPTATIF PAR NAVIRE
-v_min <- 0.15; v_max <- 0.80; seuil_global <- 0.30; n_min <- 1000
-dbg_head("🔧 Calcul des seuils d'arrêt adaptatifs par navire")
-seuils_par_navire <- ais_data_core[Speed > 0, .(q05=quantile(Speed,0.05,na.rm=TRUE), N=.N), by=Navire]
-seuils_par_navire[, seuil_adapt := pmax(v_min, pmin(v_max, q05))]
-seuils_par_navire[N < n_min,   seuil_adapt := seuil_global]
-ais_data_core <- merge(ais_data_core, seuils_par_navire[, .(Navire, seuil_adapt)], by = "Navire", all.x = TRUE)
-ais_data_core[, is_stop := Speed <= seuil_adapt]
-diag_seuils <- seuils_par_navire[, .(Navire, N_pts=N, q05_kn=round(q05,3), seuil_final=round(seuil_adapt,3))]
-dbg_head("📊 Seuils d'arrêt calculés par navire :"); print(diag_seuils)
+# Pondération temporelle après le filtrage spatial
+delta_t_max <- 900  # 15 minutes
+ais_data_core[, delta_t := as.numeric(shift(Timestamp, type="lead") - Timestamp,
+                                      units="secs"), by = .(Navire, Seg_id)]
+ais_data_core[is.na(delta_t), delta_t := delta_t_max]
+ais_data_core[, delta_t := pmin(pmax(delta_t, 1), delta_t_max)]
 
 # 7. GMM : 1 "stop" + 4 composantes
 ais_data_core <- ais_data_core[Speed <= 20]
 ais_data_core[, paste0("p_component_",1:5) := 0.0]
-speeds_move <- ais_data_core[is_stop == FALSE, Speed]
+speeds_move <- ais_data_core[is_stop_spatial == FALSE, Speed]
 set.seed(42)
 gmm4 <- Mclust(speeds_move, G = 1:5, verbose = FALSE)
 z_move <- predict(gmm4, newdata = speeds_move)$z
-ais_data_core[is_stop == TRUE, p_component_1 := 1]
-if (nrow(z_move)>0) for(j in seq_len(ncol(z_move))) ais_data_core[is_stop == FALSE, paste0("p_component_",j+1) := z_move[,j]]
+ais_data_core[is_stop_spatial == TRUE,  p_component_1 := 1]
+if (nrow(z_move)>0) for(j in seq_len(ncol(z_move))) ais_data_core[is_stop_spatial == FALSE, paste0("p_component_",j+1) := z_move[,j]]
 ais_data_core[, comp := apply(.SD, 1, which.max), .SDcols=paste0("p_component_",1:5)]
 
 # GMM: résumé
@@ -262,6 +300,24 @@ ais_data_core[, behavior_smooth := smooth_behavior_transition(behavior, Speed, t
 ais_data_core[, sub_seg_id := paste0(Seg_id,"_",rleid(behavior_smooth))]
 dbg_head("🎭 Lissage comportemental terminé")
 
+# HMM à 5 états pour validation complémentaire
+hmm_smoother <- function(spd_std, n_states = 5) {
+  keep <- !is.na(spd_std)
+  v <- spd_std[keep]
+  if (length(v) < 20) return(rep(NA_integer_, length(spd_std)))
+  d <- data.frame(spd = v)
+  mod <- depmix(spd ~ 1, data = d, nstates = n_states, family = gaussian())
+  fit <- tryCatch(fit(mod, verbose = FALSE), error=function(e) NULL)
+  if (is.null(fit)) return(rep(NA_integer_, length(spd_std)))
+  states <- posterior(fit, type="viterbi")$state
+  out <- rep(NA_integer_, length(spd_std)); out[keep] <- states; out
+}
+ais_data_core[, Speed_std := scale(Speed)]
+ais_data_core[, hmm_state := hmm_smoother(Speed_std), by = Navire]
+state_speed <- ais_data_core[!is.na(hmm_state), .(mean_spd = mean(Speed_std)), by = hmm_state][order(mean_spd)]
+map_states <- setNames(c("stops","slow_maneuvers","dredging","loaded_transit","unloaded_transit"), state_speed$hmm_state)
+ais_data_core[, behavior_hmm := map_states[as.character(hmm_state)]]
+
 # 11. Scores composites
 mu_speed <- 2.25; sigma_speed <- 1.0
 ais_data_core[, prob_dredge_gmm := p_component_3]
@@ -278,8 +334,6 @@ ais_data_core[, Dragage_OLD := as.integer(dragage_score_OLD >= 0.5)]
 ais_data_core[, Dragage_GMM := as.integer(dragage_score_GMM >= 0.5)]
 ais_data_core[, Dragage_SPEED := as.integer(dragage_score_SPEED >= 0.5)]
 ais_data_core[, Dragage_RANGE := as.integer(dragage_score_RANGE >= 0.5)]
-fwrite(ais_data_core, file.path(out_dir, "AIS_data_core_preprocessed_V6.csv"))
-saveRDS(ais_data_core, file = file.path(out_dir, "AIS_data_core_preprocessed_V6.rds"), compress="xz")
 
 # Contrôles diagnostic
 dbg_head("État avant grid-search - NOUVEAU SYSTÈME avec seuils adaptatifs")
@@ -303,20 +357,23 @@ eval_cross_validation_robust <- function(ais_tmp, approach_name, w) {
     yr    <- yrs[k]
     train <- copy(ais_tmp[Annee != yr])
     test  <- copy(ais_tmp[Annee == yr])
+    if (!"delta_t" %in% names(train) || !"delta_t" %in% names(test))
+      stop("delta_t manquant")
     if (length(unique(train$label_tmp_num)) < 2 || length(unique(test$label_tmp_num)) < 2) { aucs[k] <- 0.5; next }
     if (approach_name == "GMM") {
       set.seed(42)
-      gmm_fold <- Mclust(train[is_stop == FALSE, Speed], G = 1:5, verbose = FALSE)
+      gmm_fold <- Mclust(train[is_stop_spatial == FALSE, Speed], G = 1:5, verbose = FALSE)
       dredge_comp <- which.min(abs(gmm_fold$parameters$mean - 2.5))
-      train_move <- train[is_stop == FALSE, Speed]; test_move <- test[is_stop == FALSE, Speed]
+      train_move <- train[is_stop_spatial == FALSE, Speed];
+      test_move  <- test[is_stop_spatial == FALSE, Speed]
       z_train <- predict(gmm_fold, newdata = train_move)$z
       z_test  <- predict(gmm_fold, newdata =  test_move)$z
       train[, paste0("p_component_", 1:(ncol(z_train)+1)) := 0.0]
       test[,  paste0("p_component_", 1:(ncol(z_test)+1)) := 0.0]
-      train[is_stop == TRUE,  p_component_1 := 1]
-      test[ is_stop == TRUE,  p_component_1 := 1]
-      for (j in seq_len(ncol(z_train))) train[is_stop == FALSE, paste0("p_component_",j+1) := z_train[,j]]
-      for (j in seq_len(ncol(z_test)))  test[is_stop == FALSE,  paste0("p_component_",j+1) := z_test[,j]]
+      train[is_stop_spatial == TRUE,  p_component_1 := 1]
+      test[ is_stop_spatial == TRUE,  p_component_1 := 1]
+      for (j in seq_len(ncol(z_train))) train[is_stop_spatial == FALSE, paste0("p_component_",j+1) := z_train[,j]]
+      for (j in seq_len(ncol(z_test)))  test[is_stop_spatial == FALSE,  paste0("p_component_",j+1) := z_test[,j]]
       train[, prob_gmm_fold := get(paste0("p_component_",dredge_comp+1))]
       test [, prob_gmm_fold := get(paste0("p_component_",dredge_comp+1))]
       train[, score_fold := w[1]*prob_gmm_fold + w[2]*norm_course_change + w[3]*norm_accel]
@@ -324,16 +381,37 @@ eval_cross_validation_robust <- function(ais_tmp, approach_name, w) {
     } else {
       train[, score_fold := score_tmp]; test[, score_fold := score_tmp]
     }
-    glm_fit <- glm(label_tmp_num ~ score_fold, data = train, family = binomial(link = "logit"))
+    glm_fit <- glm(label_tmp_num ~ score_fold, data = train, family = binomial(link = "logit"), weights = train$delta_t)
     probs   <- predict(glm_fit, newdata = test, type = "response")
     aucs[k] <- pROC::auc(pROC::roc(test$label_tmp_num, probs, quiet=TRUE))
   }
   mean(aucs, na.rm = TRUE)
 }
-eval_weights_GMM <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*prob_dredge_gmm + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Speed, norm_course_change, norm_accel, Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "GMM", w)}
-eval_weights_SPEED <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_norm + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "SPEED", w)}
-eval_weights_RANGE <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_in_dredge_range + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "RANGE", w)}
-eval_weights_OLD <- function(w) {ais_tmp <- ais_data_core[, .(score_tmp = w[1]*dredging_indicator + w[2]*norm_course_change + w[3]*norm_accel, label_tmp = as.integer(behavior_smooth=="dredging"), Annee, Navire)][complete.cases(score_tmp,label_tmp,Annee,Navire)]; eval_cross_validation_robust(ais_tmp, "OLD", w)}
+eval_weights_GMM <- function(w) {
+  ais_tmp <- ais_data_core[, .(score_tmp = w[1]*prob_dredge_gmm + w[2]*norm_course_change + w[3]*norm_accel,
+                               label_tmp = as.integer(behavior_smooth=="dredging"),
+                               Speed, norm_course_change, norm_accel,
+                               Annee, Navire, delta_t, is_stop_spatial)][complete.cases(score_tmp,label_tmp,Annee,Navire)]
+  eval_cross_validation_robust(ais_tmp, "GMM", w)
+}
+eval_weights_SPEED <- function(w) {
+  ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_norm + w[2]*norm_course_change + w[3]*norm_accel,
+                               label_tmp = as.integer(behavior_smooth=="dredging"),
+                               Annee, Navire, delta_t, is_stop_spatial)][complete.cases(score_tmp,label_tmp,Annee,Navire)]
+  eval_cross_validation_robust(ais_tmp, "SPEED", w)
+}
+eval_weights_RANGE <- function(w) {
+  ais_tmp <- ais_data_core[, .(score_tmp = w[1]*speed_in_dredge_range + w[2]*norm_course_change + w[3]*norm_accel,
+                               label_tmp = as.integer(behavior_smooth=="dredging"),
+                               Annee, Navire, delta_t, is_stop_spatial)][complete.cases(score_tmp,label_tmp,Annee,Navire)]
+  eval_cross_validation_robust(ais_tmp, "RANGE", w)
+}
+eval_weights_OLD <- function(w) {
+  ais_tmp <- ais_data_core[, .(score_tmp = w[1]*dredging_indicator + w[2]*norm_course_change + w[3]*norm_accel,
+                               label_tmp = as.integer(behavior_smooth=="dredging"),
+                               Annee, Navire, delta_t, is_stop_spatial)][complete.cases(score_tmp,label_tmp,Annee,Navire)]
+  eval_cross_validation_robust(ais_tmp, "OLD", w)
+}
 
 # === GRID SEARCH ===
 DBG_PRINT_EVERY <- 10
