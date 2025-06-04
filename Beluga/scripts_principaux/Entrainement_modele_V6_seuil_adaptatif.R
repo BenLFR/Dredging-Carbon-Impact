@@ -143,12 +143,6 @@ ais_data_core[is.na(Course_change), Course_change := 0]
 q95 <- quantile(ais_data_core$Course_change, 0.95, na.rm = TRUE)
 ais_data_core[, norm_course_change := pmax(0, pmin(1, 1 - Course_change/q95))]
 
-delta_t_max <- 900  # 15 minutes
-ais_data_core[, delta_t := as.numeric(shift(Timestamp, type="lead") - Timestamp,
-                                      units="secs"), by = .(Navire, Seg_id)]
-ais_data_core[is.na(delta_t), delta_t := delta_t_max]
-ais_data_core[, delta_t := pmin(pmax(delta_t, 1), delta_t_max)]
-
 # 6.c SEUIL D'ARRÊT ADAPTATIF PAR NAVIRE
 compute_seuils <- function(dt, v_min = 0.15, v_max = 0.80,
                           seuil_global = 0.30, n_min = 1000) {
@@ -180,7 +174,7 @@ library(dbscan) # déjà chargé en tête
 
 # Fonction pour calculer eps automatiquement (heuristique ou k-distance)
 auto_eps <- function(coords, k = 4) {
-  # coords : matrice [lon, lat]
+  # coords : matrice [lon, lat] en degrés (1 m ~ 0.000009°)
   dists <- kNNdist(coords, k = k)
   # Heuristique : 1 % de la médiane des distances entre arrêts
   eps_heur <- 0.01 * median(dists, na.rm = TRUE)
@@ -197,7 +191,7 @@ cluster_stops_spatial <- function(dt, eps = NULL, minPts = 4) {
     return(dt)
   }
   coords <- as.matrix(arr[, .(Lon, Lat)])
-  # Calculer eps si non fourni
+  # Calculer eps si non fourni. Passer eps manuellement si la densité varie beaucoup
   if (is.null(eps)) eps <- auto_eps(coords, k = minPts)
   db <- dbscan(coords, eps = eps, minPts = minPts)
   arr[, stop_cluster_id := db$cluster]
@@ -230,6 +224,13 @@ cat("Pourcentage d'arrêts dans un cluster spatial (port/mouillage) :",
 
 
 # Remarque : utiliser is_stop_spatial à la place de is_stop dans les étapes suivantes
+
+# Pondération temporelle après le filtrage spatial
+delta_t_max <- 900  # 15 minutes
+ais_data_core[, delta_t := as.numeric(shift(Timestamp, type="lead") - Timestamp,
+                                      units="secs"), by = .(Navire, Seg_id)]
+ais_data_core[is.na(delta_t), delta_t := delta_t_max]
+ais_data_core[, delta_t := pmin(pmax(delta_t, 1), delta_t_max)]
 
 # 7. GMM : 1 "stop" + 4 composantes
 ais_data_core <- ais_data_core[Speed <= 20]
@@ -333,8 +334,6 @@ ais_data_core[, Dragage_OLD := as.integer(dragage_score_OLD >= 0.5)]
 ais_data_core[, Dragage_GMM := as.integer(dragage_score_GMM >= 0.5)]
 ais_data_core[, Dragage_SPEED := as.integer(dragage_score_SPEED >= 0.5)]
 ais_data_core[, Dragage_RANGE := as.integer(dragage_score_RANGE >= 0.5)]
-fwrite(ais_data_core, file.path(out_dir, "AIS_data_core_preprocessed_V6.csv"))
-saveRDS(ais_data_core, file = file.path(out_dir, "AIS_data_core_preprocessed_V6.rds"), compress="xz")
 
 # Contrôles diagnostic
 dbg_head("État avant grid-search - NOUVEAU SYSTÈME avec seuils adaptatifs")
