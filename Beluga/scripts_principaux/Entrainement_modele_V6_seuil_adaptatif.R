@@ -203,7 +203,9 @@ cluster_stops_spatial <- function(dt, eps = NULL, minPts = 4) {
   arr[, stop_cluster_id := db$cluster]
   arr[, stop_cluster_core := db$cluster > 0]
   # Remettre les labels dans le jeu principal
-  dt <- merge(dt, arr[, .(Timestamp, stop_cluster_id, stop_cluster_core)], by = "Timestamp", all.x = TRUE)
+  dt <- merge(dt,
+              arr[, .(Seg_id, Timestamp, stop_cluster_id, stop_cluster_core)],
+              by = c("Seg_id", "Timestamp"), all.x = TRUE)
   # True stop : arrêt ET cluster spatial
   dt[, is_stop_spatial := is_stop & !is.na(stop_cluster_id) & stop_cluster_id > 0]
   return(dt)
