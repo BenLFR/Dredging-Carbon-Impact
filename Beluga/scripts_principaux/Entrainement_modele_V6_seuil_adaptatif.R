@@ -130,11 +130,6 @@ ais_data_core[is.na(Course_change), Course_change := 0]
 q95 <- quantile(ais_data_core$Course_change, 0.95, na.rm = TRUE)
 ais_data_core[, norm_course_change := pmax(0, pmin(1, 1 - Course_change/q95))]
 
-# Pondération temporelle (Δt) pour chaque ping
-ais_data_core <- ais_data_core[order(Navire, Seg_id, Timestamp)]
-ais_data_core[, delta_t := c(as.numeric(diff(Timestamp)), NA), by = .(Navire, Seg_id)]
-ais_data_core[delta_t <= 0 | delta_t > 900 | is.na(delta_t), delta_t := 60]
-
 # Détection d'outliers sur la vitesse (test de Grubbs)
 dbg_head("🔎 Détection d'outliers de vitesse (Grubbs)")
 g_out <- tryCatch(grubbs.test(ais_data_core$Speed), error=function(e) NULL)
@@ -142,6 +137,25 @@ if (!is.null(g_out) && g_out$p.value < 0.01) {
   ais_data_core <- ais_data_core[Speed <= 20]
   dbg_head("Outliers supprimés")
 }
+
+# Recalculer les variables dépendantes après filtrage
+ais_data_core <- ais_data_core[order(Navire, Seg_id, Timestamp)]
+delta_t_max <- 900  # 15 minutes
+ais_data_core[, delta_t := as.numeric(shift(Timestamp, type="lead") - Timestamp,
+                                      units="secs"), by = .(Navire, Seg_id)]
+ais_data_core[is.na(delta_t), delta_t := delta_t_max]
+ais_data_core[, delta_t := pmin(pmax(delta_t, 1), delta_t_max)]
+
+# 6.c SEUIL D'ARRÊT ADAPTATIF PAR NAVIRE
+v_min <- 0.15; v_max <- 0.80; seuil_global <- 0.30; n_min <- 1000
+dbg_head("🔧 Calcul des seuils d'arrêt adaptatifs par navire")
+seuils_par_navire <- ais_data_core[Speed > 0, .(q05 = quantile(Speed, 0.05, na.rm = TRUE), N = .N), by = Navire]
+seuils_par_navire[, seuil_adapt := pmax(v_min, pmin(v_max, q05))]
+seuils_par_navire[N < n_min, seuil_adapt := seuil_global]
+ais_data_core <- merge(ais_data_core, seuils_par_navire[, .(Navire, seuil_adapt)], by = "Navire", all.x = TRUE)
+ais_data_core[, is_stop := Speed <= seuil_adapt]
+diag_seuils <- seuils_par_navire[, .(Navire, N_pts = N, q05_kn = round(q05, 3), seuil_final = round(seuil_adapt, 3))]
+dbg_head("📊 Seuils d'arrêt calculés par navire :"); print(diag_seuils)
 
 # ==============================================================================
 # 6.d  Filtrage spatial des arrêts : DBSCAN/HDBSCAN
@@ -197,18 +211,8 @@ print(diag_dbscan)
 cat("Pourcentage d'arrêts dans un cluster spatial (port/mouillage) :",
     round(100*mean(ais_data_core[is_stop == TRUE]$stop_cluster_core, na.rm = TRUE), 1), "%\n")
 
-# Remarque : utiliser is_stop_spatial à la place de is_stop dans les étapes suivantes
 
-# 6.c SEUIL D'ARRÊT ADAPTATIF PAR NAVIRE
-v_min <- 0.15; v_max <- 0.80; seuil_global <- 0.30; n_min <- 1000
-dbg_head("🔧 Calcul des seuils d'arrêt adaptatifs par navire")
-seuils_par_navire <- ais_data_core[Speed > 0, .(q05=quantile(Speed,0.05,na.rm=TRUE), N=.N), by=Navire]
-seuils_par_navire[, seuil_adapt := pmax(v_min, pmin(v_max, q05))]
-seuils_par_navire[N < n_min,   seuil_adapt := seuil_global]
-ais_data_core <- merge(ais_data_core, seuils_par_navire[, .(Navire, seuil_adapt)], by = "Navire", all.x = TRUE)
-ais_data_core[, is_stop := Speed <= seuil_adapt]
-diag_seuils <- seuils_par_navire[, .(Navire, N_pts=N, q05_kn=round(q05,3), seuil_final=round(seuil_adapt,3))]
-dbg_head("📊 Seuils d'arrêt calculés par navire :"); print(diag_seuils)
+# Remarque : utiliser is_stop_spatial à la place de is_stop dans les étapes suivantes
 
 # 7. GMM : 1 "stop" + 4 composantes
 ais_data_core <- ais_data_core[Speed <= 20]
@@ -337,6 +341,8 @@ eval_cross_validation_robust <- function(ais_tmp, approach_name, w) {
     yr    <- yrs[k]
     train <- copy(ais_tmp[Annee != yr])
     test  <- copy(ais_tmp[Annee == yr])
+    if (!"delta_t" %in% names(train) || !"delta_t" %in% names(test))
+      stop("delta_t manquant")
     if (length(unique(train$label_tmp_num)) < 2 || length(unique(test$label_tmp_num)) < 2) { aucs[k] <- 0.5; next }
     if (approach_name == "GMM") {
       set.seed(42)
