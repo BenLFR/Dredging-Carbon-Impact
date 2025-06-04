@@ -378,7 +378,7 @@ eval_cross_validation_robust <- function(ais_tmp, approach_name, w) {
     }
     glm_fit <- glm(label_tmp_num ~ score_fold, data = train, family = binomial(link = "logit"), weights = train$delta_t)
     probs   <- predict(glm_fit, newdata = test, type = "response")
-    aucs[k] <- pROC::auc(pROC::roc(test$label_tmp_num, probs, quiet=TRUE, weights = test$delta_t))
+    aucs[k] <- pROC::auc(pROC::roc(test$label_tmp_num, probs, quiet=TRUE))
   }
   mean(aucs, na.rm = TRUE)
 }
